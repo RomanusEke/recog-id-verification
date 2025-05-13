@@ -125,7 +125,7 @@ resource "aws_lambda_function" "cognito_pre_signup" {
 
   environment {
     variables = {
-      ALLOWED_EMAIL_DOMAINS = "example.com" # Change to your allowed domains
+      ALLOWED_EMAIL_DOMAINS = "gmail.com" # Change to your allowed domains
     }
   }
 }
@@ -189,29 +189,132 @@ resource "aws_api_gateway_authorizer" "cognito" {
 }
 
 # Lambda for identity verification
-resource "aws_lambda_function" "verify_identity" {
-  filename = "verify_identity.zip" # You need to create this zip file with your Lambda code
-  function_name = "verify-identity"
-  role = aws_iam_role.lambda_exec.arn
-  handler = "index.handler"
-  runtime = "nodejs18.x"
+# resource "aws_lambda_function" "verify_identity" {
+#   filename = "verify_identity.zip" # You need to create this zip file with your Lambda code
+#   function_name = "verify-identity"
+#   role = aws_iam_role.lambda_exec.arn
+#   handler = "index.handler"
+#   runtime = "nodejs18.x"
+
+#   environment {
+#     variables = {
+#       REKOGNITION_ROLE_ARN = aws_iam_role.rekognition_liveness_role.arn
+#       DOCUMENT_BUCKET = aws_s3_bucket.identity_documents.bucket
+#     }
+#   }
+# }
+
+# resource "aws_lambda_permission" "apigw_lambda" {
+#   statement_id = "AllowExecutionFromAPIGateway"
+#   action = "lambda:InvokeFunction"
+#   function_name = aws_lambda_function.verify_identity.function_name
+#   principal = "apigateway.amazonaws.com"
+
+#   source_arn = "${aws_api_gateway_rest_api.identity_api.execution_arn}/*/*"
+# } 
+
+resource "aws_lambda_function" "identity_verification" {
+  filename      = "identityVerification.zip"
+  function_name = "identity-verification"
+  role          = aws_iam_role.verification_lambda_role.arn
+  handler       = "index.handler"
+  runtime       = "nodejs18.x"
+  timeout       = 30
+  memory_size   = 512
 
   environment {
     variables = {
-      REKOGNITION_ROLE_ARN = aws_iam_role.rekognition_liveness_role.arn
-      DOCUMENT_BUCKET = aws_s3_bucket.identity_documents.bucket
+      DOCUMENT_BUCKET          = aws_s3_bucket.identity_documents.id
+      VERIFICATION_TABLE       = aws_dynamodb_table.verification_results.name
+      MIN_LIVENESS_CONFIDENCE  = 90
     }
   }
 }
 
-resource "aws_lambda_permission" "apigw_lambda" {
-  statement_id = "AllowExecutionFromAPIGateway"
-  action = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.verify_identity.function_name
-  principal = "apigateway.amazonaws.com"
+resource "aws_iam_role" "verification_lambda_role" {
+  name = "identity-verification-lambda-role"
 
-  source_arn = "${aws_api_gateway_rest_api.identity_api.execution_arn}/*/*"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
 }
+
+resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
+  role       = aws_iam_role.verification_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_policy" "verification_lambda_policy" {
+  name        = "identity-verification-lambda-policy"
+  description = "Permissions for identity verification Lambda"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "rekognition:CreateFaceLivenessSession",
+          "rekognition:GetFaceLivenessSessionResults",
+          "rekognition:CompareFaces",
+          "rekognition:DetectFaces"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "textract:AnalyzeDocument"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.identity_documents.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
+        ]
+        Resource = [
+          aws_dynamodb_table.verification_results.arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "verification_lambda_attach" {
+  role       = aws_iam_role.verification_lambda_role.name
+  policy_arn = aws_iam_policy.verification_lambda_policy.arn
+}
+
+resource "aws_lambda_permission" "apigw_invoke" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.identity_verification.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.identity_api.execution_arn}/*/*"
+}
+
 
 # Amplify for React app hosting
 resource "aws_amplify_app" "identity_verification" {
